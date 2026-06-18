@@ -1,0 +1,67 @@
+services:
+
+  aggregator:
+    build:
+      context: .
+      dockerfile: aggregator/Dockerfile
+
+    container_name: aggregator
+
+    ports:
+      - "8080:8080"
+
+    environment:
+      DATABASE_URL: postgresql://user:pass@storage:5432/logdb
+      REDIS_URL: redis://broker:6379
+
+    depends_on:
+      - storage
+      - broker
+
+    restart: unless-stopped
+
+  publisher:
+    build:
+      context: .
+      dockerfile: publisher/Dockerfile
+
+    container_name: publisher
+
+    environment:
+      REDIS_URL: redis://broker:6379
+      TARGET_URL: http://aggregator:8080/publish
+
+    depends_on:
+      - broker
+      - aggregator
+
+    restart: unless-stopped
+
+  broker:
+    image: redis:7-alpine
+
+    container_name: broker
+
+    volumes:
+      - broker_data:/data
+
+    restart: unless-stopped
+
+  storage:
+    image: postgres:16-alpine
+
+    container_name: storage
+
+    environment:
+      POSTGRES_DB: logdb
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  broker_data:
