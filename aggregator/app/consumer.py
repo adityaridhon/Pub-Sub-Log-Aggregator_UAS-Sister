@@ -1,11 +1,14 @@
 import json
 import redis
+import os
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models import ProcessedEvent, Stats
+from app.models import ProcessedEvent
+from app.models import Stats
 
 r = redis.Redis.from_url(
     settings.REDIS_URL,
@@ -19,76 +22,105 @@ def start_consumer():
 
     pubsub.subscribe("logs")
 
-    print("Consumer started...", flush=True)
+    print(
+        f"Consumer started PID={os.getpid()}",
+        flush=True
+    )
 
-    for message in pubsub.listen():
+    while True:
 
-        if message["type"] != "message":
-            continue
+        for message in pubsub.listen():
 
-        data = json.loads(
-            message["data"]
-        )
+            if message["type"] != "message":
+                continue
 
-        db = SessionLocal()
+            data = json.loads(
+                message["data"]
+            )
 
-        try:
+            db = SessionLocal()
 
-            stats = db.query(Stats).first()
+            try:
 
-            if not stats:
-                stats = Stats()
-                db.add(stats)
+                stats = db.query(Stats).first()
+
+                if not stats:
+
+                    stats = Stats(
+                        received=0,
+                        unique_processed=0,
+                        duplicate_dropped=0
+                    )
+
+                    db.add(stats)
+                    db.commit()
+
+                stmt = (
+                    insert(ProcessedEvent)
+                    .values(
+                        topic=data["topic"],
+                        event_id=data["event_id"],
+                        timestamp=data["timestamp"],
+                        source=data["source"],
+                        payload=data["payload"]
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=[
+                            "topic",
+                            "event_id"
+                        ]
+                    )
+                )
+
+                result = db.execute(stmt)
+
+                if result.rowcount == 1:
+
+                    db.execute(
+                        text(
+                            """
+                            UPDATE stats
+                            SET
+                                received = received + 1,
+                                unique_processed = unique_processed + 1
+                            """
+                        )
+                    )
+
+                    print(
+                        f"PROCESSED: {data['event_id']}",
+                        flush=True
+                    )
+
+                else:
+
+                    db.execute(
+                        text(
+                            """
+                            UPDATE stats
+                            SET
+                                received = received + 1,
+                                duplicate_dropped = duplicate_dropped + 1
+                            """
+                        )
+                    )
+
+                    print(
+                        f"DUPLICATE: {data['event_id']}",
+                        flush=True
+                    )
+
                 db.commit()
-                db.refresh(stats)
 
-            stats.received += 1
+            except Exception as e:
 
-            event = ProcessedEvent(
-                topic=data["topic"],
-                event_id=data["event_id"],
-                timestamp=data["timestamp"],
-                source=data["source"],
-                payload=data["payload"]
-            )
+                db.rollback()
 
-            db.add(event)
+                print(
+                    f"ERROR: {e}",
+                    flush=True
+                )
 
-            db.commit()
+            finally:
 
-            stats.unique_processed += 1
-
-            db.commit()
-
-            print(
-                f"PROCESSED: {data['event_id']}",
-                flush=True
-            )
-
-        except IntegrityError:
-
-            db.rollback()
-
-            stats = db.query(Stats).first()
-
-            stats.duplicate_dropped += 1
-
-            db.commit()
-
-            print(
-                f"DUPLICATE: {data['event_id']}",
-                flush=True
-            )
-
-        except Exception as e:
-
-            db.rollback()
-
-            print(
-                f"ERROR: {e}",
-                flush=True
-            )
-
-        finally:
-
-            db.close()
+                db.close()
