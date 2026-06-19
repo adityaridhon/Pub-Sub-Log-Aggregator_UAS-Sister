@@ -4,7 +4,7 @@ import json
 from fastapi import FastAPI
 from fastapi import Depends
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, func
 from datetime import datetime
 
 from app.database import engine
@@ -15,6 +15,8 @@ from app.models import ProcessedEvent
 from app.schemas import Event
 from app.redis_client import redis_client
 from app.consumer import start_consumer
+from app.schemas import BatchEvent
+from app.database import SessionLocal
 
 Base.metadata.create_all(bind=engine)
 
@@ -28,10 +30,34 @@ app = FastAPI(
 @app.on_event("startup")
 def startup_event():
 
-    Thread(
-        target=start_consumer,
-        daemon=True
-    ).start()
+    db = SessionLocal()
+
+    try:
+
+        stats = db.query(Stats).first()
+
+        if not stats:
+
+            db.add(
+                Stats(
+                    received=0,
+                    unique_processed=0,
+                    duplicate_dropped=0
+                )
+            )
+
+            db.commit()
+
+    finally:
+
+        db.close()
+
+    for _ in range(4):
+
+        Thread(
+            target=start_consumer,
+            daemon=True
+        ).start()
 
 
 @app.get("/")
@@ -67,6 +93,26 @@ def publish(event: Event):
         "subscribers": subscribers
     }
 
+@app.post("/publish-batch")
+def publish_batch(batch: BatchEvent):
+
+    pipe = redis_client.pipeline()
+
+    for event in batch.events:
+
+        pipe.publish(
+            "logs",
+            json.dumps(
+                event.model_dump(),
+                default=str
+            )
+        )
+
+    results = pipe.execute()
+
+    return {
+        "accepted": len(results)
+    }
 
 @app.get("/events")
 def get_events(
@@ -104,6 +150,7 @@ def stats(
     stats_row = db.query(Stats).first()
 
     if not stats_row:
+
         return {
             "received": 0,
             "unique_processed": 0,
@@ -112,18 +159,22 @@ def stats(
             "uptime": 0
         }
 
-    topic_counts = {}
+    topic_counts = dict(
 
-    events = db.query(ProcessedEvent).all()
-
-    for event in events:
-
-        topic_counts[event.topic] = (
-            topic_counts.get(event.topic, 0) + 1
+        db.query(
+            ProcessedEvent.topic,
+            func.count()
         )
+        .group_by(
+            ProcessedEvent.topic
+        )
+        .all()
+
+    )
 
     uptime_seconds = int(
-        (datetime.utcnow() - START_TIME).total_seconds()
+        (datetime.utcnow() - START_TIME)
+        .total_seconds()
     )
 
     return {

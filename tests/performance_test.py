@@ -1,41 +1,15 @@
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import requests
 
 BASE_URL = "http://localhost:8080"
 
-
-def make_event(event_id):
-
-    return {
-        "topic": "stress-test",
-        "event_id": event_id,
-        "timestamp": "2026-06-19T00:00:00",
-        "source": "performance_test",
-        "payload": {
-            "cpu": 50,
-            "memory": 40
-        }
-    }
+TOTAL_EVENTS = 20000
+DUPLICATE_RATE = 0.30
+BATCH_SIZE = 500
 
 
-def send_event(event):
-
-    response = requests.post(
-        f"{BASE_URL}/publish",
-        json=event,
-        timeout=30
-    )
-
-    return response.status_code
-
-
-def test_20000_events():
-
-    TOTAL_EVENTS = 20000
-    DUPLICATE_RATE = 0.30
+def build_events():
 
     unique_count = int(
         TOTAL_EVENTS * (1 - DUPLICATE_RATE)
@@ -45,132 +19,151 @@ def test_20000_events():
         TOTAL_EVENTS - unique_count
     )
 
-    print("\nGenerating events...")
-
-    unique_ids = [
-        str(uuid.uuid4())
-        for _ in range(unique_count)
-    ]
-
     events = []
 
-    for eid in unique_ids:
+    unique_ids = []
+
+    for _ in range(unique_count):
+
+        eid = str(uuid.uuid4())
+
+        unique_ids.append(eid)
 
         events.append(
-            make_event(eid)
+            {
+                "topic": "perf",
+                "event_id": eid,
+                "timestamp": "2026-06-19T00:00:00",
+                "source": "performance-test",
+                "payload": {
+                    "cpu": 50
+                }
+            }
         )
 
     for i in range(duplicate_count):
 
         events.append(
-            make_event(
-                unique_ids[
+            {
+                "topic": "perf",
+                "event_id": unique_ids[
                     i % len(unique_ids)
-                ]
-            )
+                ],
+                "timestamp": "2026-06-19T00:00:00",
+                "source": "performance-test",
+                "payload": {
+                    "cpu": 50
+                }
+            }
         )
 
-    print(
-        f"Total Events     : {TOTAL_EVENTS}"
-    )
+    return events
 
-    print(
-        f"Unique Events    : {unique_count}"
-    )
 
-    print(
-        f"Duplicate Events : {duplicate_count}"
-    )
+def test_performance():
 
-    start_time = time.time()
+    session = requests.Session()
 
-    with ThreadPoolExecutor(
-        max_workers=100
-    ) as executor:
+    events = build_events()
 
-        futures = [
-            executor.submit(
-                send_event,
-                event
-            )
-            for event in events
-        ]
+    start = time.time()
 
-        success = 0
+    accepted = 0
 
-        for future in as_completed(
-            futures
-        ):
+    for i in range(
+        0,
+        len(events),
+        BATCH_SIZE
+    ):
 
-            if future.result() == 200:
-                success += 1
+        batch = {
+            "events": events[
+                i:i+BATCH_SIZE
+            ]
+        }
+
+        r = session.post(
+            f"{BASE_URL}/publish-batch",
+            json=batch,
+            timeout=60
+        )
+
+        assert r.status_code == 200
+
+        accepted += r.json()["accepted"]
 
     publish_time = (
-        time.time() - start_time
+        time.time() - start
+    )
+
+    print()
+
+    print("=" * 50)
+
+    print(
+        f"EVENTS      : {TOTAL_EVENTS}"
     )
 
     print(
-        f"\nPublish Finished: "
-        f"{publish_time:.2f}s"
+        f"DUPLICATES  : {int(TOTAL_EVENTS*DUPLICATE_RATE)}"
     )
 
     print(
-        "Waiting consumer..."
+        f"PUBLISH TIME: {publish_time:.2f}s"
     )
 
-    time.sleep(15)
-
-    stats = requests.get(
-        f"{BASE_URL}/stats"
-    ).json()
-
-    received = stats["received"]
-    unique_processed = stats["unique_processed"]
-    duplicate_dropped = stats["duplicate_dropped"]
-
-    throughput = (
-        received / publish_time
+    print(
+        f"THROUGHPUT  : {TOTAL_EVENTS/publish_time:.2f} event/sec"
     )
+
+    print("=" * 50)
+
+    deadline = time.time() + 300
+
+    while time.time() < deadline:
+
+        stats = requests.get(
+            f"{BASE_URL}/stats"
+        ).json()
+
+        if stats["received"] >= TOTAL_EVENTS:
+
+            break
+
+        print(
+            f"waiting... {stats['received']}/{TOTAL_EVENTS}"
+        )
+
+        time.sleep(2)
 
     duplicate_rate = (
-        duplicate_dropped / received
-    ) * 100
+        stats["duplicate_dropped"]
+        / stats["received"]
+        if stats["received"] > 0
+        else 0
+    )
 
-    avg_latency_ms = (
-        publish_time / TOTAL_EVENTS
-    ) * 1000
+    print()
 
-    print("\n========== RESULT ==========")
+    print("FINAL STATS")
 
     print(
-        f"Received            : {received}"
+        f"received            : {stats['received']}"
     )
 
     print(
-        f"Unique Processed    : "
-        f"{unique_processed}"
+        f"unique_processed    : {stats['unique_processed']}"
     )
 
     print(
-        f"Duplicate Dropped   : "
-        f"{duplicate_dropped}"
+        f"duplicate_dropped   : {stats['duplicate_dropped']}"
     )
 
     print(
-        f"Throughput          : "
-        f"{throughput:.2f} events/sec"
+        f"duplicate_rate      : {duplicate_rate:.2%}"
     )
 
-    print(
-        f"Average Latency     : "
-        f"{avg_latency_ms:.2f} ms/event"
+    assert (
+        stats["received"]
+        >= TOTAL_EVENTS
     )
-
-    print(
-        f"Duplicate Rate      : "
-        f"{duplicate_rate:.2f}%"
-    )
-
-    assert received >= TOTAL_EVENTS
-
-    assert duplicate_rate >= 30

@@ -1,6 +1,5 @@
 import json
 import redis
-import os
 
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert
@@ -8,7 +7,9 @@ from sqlalchemy.dialects.postgresql import insert
 from app.config import settings
 from app.database import SessionLocal
 from app.models import ProcessedEvent
-from app.models import Stats
+from app.schemas import BatchEvent
+import os
+
 
 r = redis.Redis.from_url(
     settings.REDIS_URL,
@@ -22,105 +23,71 @@ def start_consumer():
 
     pubsub.subscribe("logs")
 
-    print(
-        f"Consumer started PID={os.getpid()}",
-        flush=True
-    )
+    print(f"Consumer started id: {os.getpid()}", flush=True)
 
-    while True:
+    for message in pubsub.listen():
 
-        for message in pubsub.listen():
+        if message["type"] != "message":
+            continue
 
-            if message["type"] != "message":
-                continue
+        data = json.loads(message["data"])
 
-            data = json.loads(
-                message["data"]
+        db = SessionLocal()
+
+        try:
+
+            stmt = (
+                insert(ProcessedEvent)
+                .values(
+                    topic=data["topic"],
+                    event_id=data["event_id"],
+                    timestamp=data["timestamp"],
+                    source=data["source"],
+                    payload=data["payload"]
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        "topic",
+                        "event_id"
+                    ]
+                )
             )
 
-            db = SessionLocal()
+            result = db.execute(stmt)
 
-            try:
+            if result.rowcount == 1:
 
-                stats = db.query(Stats).first()
-
-                if not stats:
-
-                    stats = Stats(
-                        received=0,
-                        unique_processed=0,
-                        duplicate_dropped=0
-                    )
-
-                    db.add(stats)
-                    db.commit()
-
-                stmt = (
-                    insert(ProcessedEvent)
-                    .values(
-                        topic=data["topic"],
-                        event_id=data["event_id"],
-                        timestamp=data["timestamp"],
-                        source=data["source"],
-                        payload=data["payload"]
-                    )
-                    .on_conflict_do_nothing(
-                        index_elements=[
-                            "topic",
-                            "event_id"
-                        ]
-                    )
+                db.execute(
+                    text("""
+                        UPDATE stats
+                        SET
+                            received = received + 1,
+                            unique_processed = unique_processed + 1
+                    """)
                 )
 
-                result = db.execute(stmt)
+            else:
 
-                if result.rowcount == 1:
-
-                    db.execute(
-                        text(
-                            """
-                            UPDATE stats
-                            SET
-                                received = received + 1,
-                                unique_processed = unique_processed + 1
-                            """
-                        )
-                    )
-
-                    print(
-                        f"PROCESSED: {data['event_id']}",
-                        flush=True
-                    )
-
-                else:
-
-                    db.execute(
-                        text(
-                            """
-                            UPDATE stats
-                            SET
-                                received = received + 1,
-                                duplicate_dropped = duplicate_dropped + 1
-                            """
-                        )
-                    )
-
-                    print(
-                        f"DUPLICATE: {data['event_id']}",
-                        flush=True
-                    )
-
-                db.commit()
-
-            except Exception as e:
-
-                db.rollback()
-
-                print(
-                    f"ERROR: {e}",
-                    flush=True
+                db.execute(
+                    text("""
+                        UPDATE stats
+                        SET
+                            received = received + 1,
+                            duplicate_dropped = duplicate_dropped + 1
+                    """)
                 )
 
-            finally:
+            db.commit()
 
-                db.close()
+        except Exception as e:
+
+            db.rollback()
+
+            print(
+                f"ERROR: {e}",
+                flush=True
+            )
+
+        finally:
+
+            db.close()

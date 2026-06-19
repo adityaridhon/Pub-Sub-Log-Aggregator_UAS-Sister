@@ -10,3 +10,6 @@ class Event(BaseModel):
     timestamp: datetime
     source: str
     payload: dict[str, Any]
+
+class BatchEvent(BaseModel):
+    events: list[Event]
